@@ -1,37 +1,45 @@
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
 import logging
+from contextlib import asynccontextmanager
 
+from fastapi import FastAPI
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.db.database import engine
+import app.models  # Register all tables with SQLAlchemy metadata.
+from app.core.register_handlers import register_exception_handlers
 from app.db.base import Base
+from app.db.database import engine
+from app.routes.auth import router as auth_router
 
 logger = logging.getLogger("uvicorn.error")
 
+
 @asynccontextmanager
-async def lifesapn(_: FastAPI):
+async def lifespan(_: FastAPI):
     try:
-        with engine.begin() as connection :
+        with engine.begin() as connection:
             connection.execute(text("SELECT 1"))
             logger.info("Database connection successful")
             Base.metadata.create_all(bind=connection)
     except SQLAlchemyError:
-        logger.error("Database initialization failed")
+        logger.exception("Database initialization failed")
         raise
 
-    finally :
+    try:
         yield
+    finally:
         engine.dispose()
-        logger.info("Database connetion pool closed")
+        logger.info("Database connection pool closed")
 
 
-app = FastAPI(title="Site Scan AI API", lifespan=lifesapn)
+app = FastAPI(title="Site Scan AI API", lifespan=lifespan)
+register_exception_handlers(app)
+app.include_router(auth_router)
+
 
 @app.get("/health")
-def get_health():
+def get_health() -> dict[str, str]:
     return {
         "status": "Server is running",
-        "time": "time"
+        "time": "time",
     }
