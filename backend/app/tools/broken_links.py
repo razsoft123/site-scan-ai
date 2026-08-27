@@ -11,7 +11,9 @@ from app.schemas.tool import ToolError, ToolResult
 from app.tools.http_safety import (
     DEFAULT_MAX_REDIRECTS,
     DEFAULT_TIMEOUT_SECONDS,
+    HostResolver,
     REDIRECT_STATUS_CODES,
+    validate_public_url_async,
     validate_target_url,
 )
 
@@ -72,6 +74,7 @@ async def _fetch_source_page(
     timeout_seconds: float,
     max_response_bytes: int,
     max_redirects: int,
+    resolver: HostResolver | None,
 ) -> _SourcePage:
     current_url = requested_url
     redirect_count = 0
@@ -110,7 +113,10 @@ async def _fetch_source_page(
 
                 redirected_url = urljoin(str(response.url), location)
                 try:
-                    current_url = validate_target_url(redirected_url)
+                    current_url = await validate_public_url_async(
+                        redirected_url,
+                        resolver,
+                    )
                 except ValueError as exc:
                     raise _SourcePageError(
                         "unsafe_redirect",
@@ -228,9 +234,21 @@ async def _check_link(
     *,
     timeout_seconds: float,
     max_redirects: int,
+    resolver: HostResolver | None,
 ) -> dict[str, object]:
     async with semaphore:
-        current_url = url
+        try:
+            current_url = await validate_public_url_async(url, resolver)
+        except ValueError as exc:
+            return {
+                "url": url,
+                "final_url": url,
+                "status_code": None,
+                "classification": "broken",
+                "redirect_count": 0,
+                "error_code": "unsafe_target",
+                "error_message": str(exc),
+            }
         redirect_count = 0
 
         try:
@@ -272,7 +290,10 @@ async def _check_link(
 
                         redirected_url = urljoin(str(response.url), location)
                         try:
-                            current_url = validate_target_url(redirected_url)
+                            current_url = await validate_public_url_async(
+                                redirected_url,
+                                resolver,
+                            )
                         except ValueError as exc:
                             return {
                                 "url": url,
@@ -341,10 +362,11 @@ async def check_broken_links(
     max_links: int = MAX_LINKS,
     concurrency_limit: int = DEFAULT_CONCURRENCY_LIMIT,
     max_redirects: int = DEFAULT_MAX_REDIRECTS,
+    resolver: HostResolver | None = None,
 ) -> ToolResult:
     started_at = perf_counter()
     try:
-        requested_url = validate_target_url(url)
+        requested_url = await validate_public_url_async(url, resolver)
     except ValueError as exc:
         return _result(
             started_at,
@@ -384,6 +406,7 @@ async def check_broken_links(
                 timeout_seconds=timeout_seconds,
                 max_response_bytes=max_response_bytes,
                 max_redirects=max_redirects,
+                resolver=resolver,
             )
         except _SourcePageError as exc:
             return _result(
@@ -451,6 +474,7 @@ async def check_broken_links(
                     link,
                     timeout_seconds=timeout_seconds,
                     max_redirects=max_redirects,
+                    resolver=resolver,
                 )
                 for link in selected_links
             )

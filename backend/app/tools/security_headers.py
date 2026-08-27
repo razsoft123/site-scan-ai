@@ -7,8 +7,9 @@ from app.schemas.tool import ToolError, ToolResult
 from app.tools.http_safety import (
     DEFAULT_MAX_REDIRECTS,
     DEFAULT_TIMEOUT_SECONDS,
+    HostResolver,
     REDIRECT_STATUS_CODES,
-    validate_target_url,
+    validate_public_url,
 )
 
 
@@ -125,10 +126,11 @@ def inspect_security_headers(
     client: httpx.Client | None = None,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     max_redirects: int = DEFAULT_MAX_REDIRECTS,
+    resolver: HostResolver | None = None,
 ) -> ToolResult:
     started_at = perf_counter()
     try:
-        requested_url = validate_target_url(url)
+        requested_url = validate_public_url(url, resolver)
     except ValueError as exc:
         return _result(
             started_at,
@@ -200,7 +202,7 @@ def inspect_security_headers(
 
                     redirected_url = urljoin(str(response.url), location)
                     try:
-                        current_url = validate_target_url(redirected_url)
+                        current_url = validate_public_url(redirected_url, resolver)
                     except ValueError as exc:
                         return _result(
                             started_at,
