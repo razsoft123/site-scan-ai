@@ -25,6 +25,13 @@ from app.models.audit import Audit
 from app.models.tool_execution import ToolExecution
 from app.models.user import User
 from app.routes.audit import router as audit_router
+from app.schemas.audit import AuditReport, ReleaseStatus
+from app.schemas.tool import ToolResult
+from app.agents.audit_agent import (
+    AuditWorkflowError,
+    ToolExecutionRecord,
+)
+from app.services import audit as audit_service
 
 
 @compiles(JSONB, "sqlite")
@@ -49,8 +56,27 @@ def db_session() -> Iterator[Session]:
 
 
 @pytest.fixture
-def client(db_session: Session) -> Iterator[TestClient]:
+def client(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[TestClient]:
     get_settings.cache_clear()
+
+    def fake_workflow(*, callbacks, **_: object) -> AuditReport:
+        callbacks.on_tools_selected([])
+        callbacks.on_report_started()
+        return AuditReport(
+            overall_score=None,
+            release_status=ReleaseStatus.UNKNOWN,
+            executive_summary="No deterministic tools were selected for this test audit.",
+            findings=[],
+            screenshot_reference=None,
+            generated_at=datetime.now(timezone.utc),
+            schema_version="1.0",
+            is_mock=False,
+        )
+
+    monkeypatch.setattr(audit_service, "run_audit_workflow", fake_workflow)
     test_app = FastAPI()
     register_exception_handlers(test_app)
     test_app.include_router(audit_router)
@@ -98,7 +124,7 @@ def create_test_audit(
     return response.json()
 
 
-def test_create_audit_returns_mock_report_and_ordered_lifecycle_events(
+def test_create_audit_returns_agentic_report_and_ordered_lifecycle_events(
     client: TestClient,
     db_session: Session,
 ) -> None:
@@ -110,7 +136,7 @@ def test_create_audit_returns_mock_report_and_ordered_lifecycle_events(
     assert audit["release_status"] == "unknown"
     assert audit["tools_executed"] == []
     assert audit["tool_executions"] == []
-    assert audit["report"]["is_mock"] is True
+    assert audit["report"]["is_mock"] is False
     assert audit["report"]["findings"] == []
 
     events_response = client.get(
@@ -123,7 +149,7 @@ def test_create_audit_returns_mock_report_and_ordered_lifecycle_events(
     assert [event["event_type"] for event in events] == [
         "audit_created",
         "status_changed",
-        "status_changed",
+        "tools_selected",
         "report_started",
         "audit_completed",
     ]
@@ -134,6 +160,99 @@ def test_create_audit_returns_mock_report_and_ordered_lifecycle_events(
         "generating_report",
         "completed",
     ]
+
+
+def test_agentic_workflow_persists_tool_result_and_grounded_report(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_workflow(*, target_url: str, callbacks, **_: object) -> AuditReport:
+        callbacks.on_tools_selected(["inspect_metadata"])
+        started_at = datetime.now(timezone.utc)
+        callbacks.on_tool_started(
+            "inspect_metadata",
+            {"url": target_url},
+            1,
+            started_at,
+        )
+        result = ToolResult(
+            tool="inspect_metadata",
+            success=True,
+            duration_ms=12,
+            data={"http_status": 200, "title": "Example"},
+        )
+        callbacks.on_tool_completed(
+            ToolExecutionRecord(
+                tool_name="inspect_metadata",
+                arguments={"url": target_url},
+                status="completed",
+                result=result,
+                started_at=started_at,
+                completed_at=datetime.now(timezone.utc),
+                sequence_number=1,
+            )
+        )
+        callbacks.on_report_started()
+        return AuditReport(
+            overall_score=None,
+            release_status=ReleaseStatus.READY,
+            executive_summary="The requested metadata check completed.",
+            findings=[],
+            screenshot_reference=None,
+            generated_at=datetime.now(timezone.utc),
+            is_mock=False,
+        )
+
+    monkeypatch.setattr(audit_service, "run_audit_workflow", fake_workflow)
+    user = create_test_user(db_session, "agent-owner@example.com")
+
+    audit = create_test_audit(client, user)
+
+    assert audit["status"] == "completed"
+    assert audit["release_status"] == "ready"
+    assert audit["tools_executed"] == ["inspect_metadata"]
+    assert audit["tool_executions"][0]["status"] == "completed"
+    assert audit["tool_executions"][0]["data"]["http_status"] == 200
+
+    events = client.get(
+        f"/audits/{audit['id']}/events",
+        headers=auth_headers(user),
+    ).json()
+    assert [event["event_type"] for event in events] == [
+        "audit_created",
+        "status_changed",
+        "tools_selected",
+        "tool_started",
+        "tool_completed",
+        "report_started",
+        "audit_completed",
+    ]
+
+
+def test_workflow_failure_is_saved_as_failed_audit(
+    client: TestClient,
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing_workflow(*, callbacks, **_: object) -> AuditReport:
+        callbacks.on_tools_selected([])
+        raise AuditWorkflowError("Gemini could not complete the audit workflow.")
+
+    monkeypatch.setattr(audit_service, "run_audit_workflow", failing_workflow)
+    user = create_test_user(db_session, "failed-owner@example.com")
+
+    audit = create_test_audit(client, user)
+
+    assert audit["status"] == "failed"
+    assert audit["report"] is None
+    assert audit["release_status"] is None
+    assert audit["error_message"] == "Gemini could not complete the audit workflow."
+    events = client.get(
+        f"/audits/{audit['id']}/events",
+        headers=auth_headers(user),
+    ).json()
+    assert events[-1]["event_type"] == "audit_failed"
 
 
 def test_audit_history_and_details_are_private_per_user(

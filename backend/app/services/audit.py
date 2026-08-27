@@ -1,5 +1,4 @@
 from datetime import datetime, timezone
-from ipaddress import ip_address
 from typing import Any
 
 from pydantic import HttpUrl
@@ -7,6 +6,12 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.agents.audit_agent import (
+    AuditWorkflowError,
+    ToolExecutionRecord,
+    WorkflowCallbacks,
+    run_audit_workflow,
+)
 from app.core.exceptions.audit import (
     AuditDatabaseError,
     AuditNotFoundError,
@@ -20,13 +25,12 @@ from app.models.user import User
 from app.schemas.audit import (
     AuditDetail,
     AuditEventResponse,
-    AuditReport,
     AuditStatus,
     AuditSummary,
     CreateAudit,
-    ReleaseStatus,
     ToolExecutionResponse,
 )
+from app.tools.http_safety import validate_public_url
 
 
 VALID_STATUS_TRANSITIONS: dict[str, set[str]] = {
@@ -50,42 +54,12 @@ VALID_STATUS_TRANSITIONS: dict[str, set[str]] = {
     AuditStatus.FAILED.value: set(),
 }
 
-BLOCKED_HOST_SUFFIXES = (
-    ".internal",
-    ".lan",
-    ".local",
-    ".localhost",
-)
-
 
 def _validate_public_target_url(target_url: HttpUrl) -> None:
-    if target_url.username is not None or target_url.password is not None:
-        raise UnsafeAuditUrlError("URLs containing credentials cannot be scanned.")
-
-    hostname = target_url.host
-    if hostname is None:
-        raise UnsafeAuditUrlError("The target URL must contain a hostname.")
-
-    hostname = hostname.lower().rstrip(".")
-    if (
-        hostname == "localhost"
-        or hostname.endswith(BLOCKED_HOST_SUFFIXES)
-        or ("." not in hostname and ":" not in hostname)
-    ):
-        raise UnsafeAuditUrlError("Local and internal hostnames cannot be scanned.")
-
-    address_text = (
-        hostname[1:-1]
-        if hostname.startswith("[") and hostname.endswith("]")
-        else hostname
-    )
     try:
-        address = ip_address(address_text)
-    except ValueError:
-        return
-
-    if not address.is_global:
-        raise UnsafeAuditUrlError("Private and non-public IP addresses cannot be scanned.")
+        validate_public_url(str(target_url))
+    except ValueError as exc:
+        raise UnsafeAuditUrlError(str(exc)) from exc
 
 
 def _next_event_sequence(db: Session, audit_id: int) -> int:
@@ -142,26 +116,13 @@ def transition_audit_status(
     return event
 
 
-def _mock_report(generated_at: datetime) -> AuditReport:
-    return AuditReport(
-        overall_score=None,
-        release_status=ReleaseStatus.UNKNOWN,
-        executive_summary=(
-            "This is a mock report. No diagnostic tools have run yet, so no "
-            "evidence-based findings or score were generated."
-        ),
-        findings=[],
-        screenshot_reference=None,
-        generated_at=generated_at,
-        schema_version="1.0",
-        is_mock=True,
-    )
-
-
 def _tool_names(tool_executions: list[ToolExecution]) -> list[str]:
     names: list[str] = []
     for execution in tool_executions:
-        if execution.tool_name not in names:
+        if (
+            execution.status in {"completed", "failed"}
+            and execution.tool_name not in names
+        ):
             names.append(execution.tool_name)
     return names
 
@@ -197,15 +158,14 @@ def create_audit(
 ) -> AuditDetail:
     _validate_public_target_url(audit_data.target_url)
     now = datetime.now(timezone.utc)
-    report = _mock_report(now)
     audit = Audit(
         user_id=current_user.id,
         target_url=str(audit_data.target_url),
         instruction=audit_data.instruction,
         status=AuditStatus.QUEUED.value,
-        report=report.model_dump(mode="json"),
-        overall_score=report.overall_score,
-        release_status=report.release_status.value,
+        report=None,
+        overall_score=None,
+        release_status=None,
     )
 
     try:
@@ -218,7 +178,7 @@ def create_audit(
                 from_status=None,
                 to_status=AuditStatus.QUEUED.value,
                 message="Audit request validated and queued.",
-                details={"mock": True},
+                details={"agentic": True},
                 sequence_number=1,
                 created_at=now,
             )
@@ -227,39 +187,171 @@ def create_audit(
             db,
             audit,
             AuditStatus.PLANNING,
-            message="Preparing the mock audit plan.",
-            details={"mock": True},
+            message="Gemini is selecting deterministic tools for the audit.",
+            details={"agentic": True},
         )
-        transition_audit_status(
-            db,
-            audit,
-            AuditStatus.RUNNING_TOOLS,
-            message="Mock tool execution stage completed without running tools.",
-            details={"mock": True, "tools": []},
+
+        def on_tools_selected(tool_names: list[str]) -> None:
+            if audit.status == AuditStatus.PLANNING.value:
+                transition_audit_status(
+                    db,
+                    audit,
+                    AuditStatus.RUNNING_TOOLS,
+                    event_type="tools_selected",
+                    message="Gemini selected the deterministic audit tools.",
+                    details={"tools": tool_names},
+                )
+                return
+            db.add(
+                AuditEvent(
+                    audit_id=audit.id,
+                    event_type="tools_selected",
+                    from_status=None,
+                    to_status=None,
+                    message="Gemini selected additional deterministic tools.",
+                    details={"tools": tool_names},
+                    sequence_number=_next_event_sequence(db, audit.id),
+                    created_at=datetime.now(timezone.utc),
+                )
+            )
+
+        def on_tool_started(
+            tool_name: str,
+            arguments: dict[str, Any],
+            sequence_number: int,
+            started_at: datetime,
+        ) -> None:
+            db.add(
+                AuditEvent(
+                    audit_id=audit.id,
+                    event_type="tool_started",
+                    from_status=None,
+                    to_status=None,
+                    message=f"Started {tool_name}.",
+                    details={
+                        "tool_name": tool_name,
+                        "arguments": arguments,
+                        "tool_sequence_number": sequence_number,
+                    },
+                    sequence_number=_next_event_sequence(db, audit.id),
+                    created_at=started_at,
+                )
+            )
+
+        def on_tool_completed(record: ToolExecutionRecord) -> None:
+            screenshot_reference = record.result.data.get("screenshot_reference")
+            if not isinstance(screenshot_reference, str):
+                screenshot_reference = None
+            db.add(
+                ToolExecution(
+                    audit_id=audit.id,
+                    tool_name=record.tool_name[:100],
+                    arguments=record.arguments,
+                    status=record.status,
+                    success=(
+                        record.result.success
+                        if record.status in {"completed", "failed"}
+                        else None
+                    ),
+                    data=record.result.data,
+                    errors=[
+                        error.model_dump(mode="json")
+                        for error in record.result.errors
+                    ],
+                    started_at=record.started_at,
+                    completed_at=record.completed_at,
+                    duration_ms=record.result.duration_ms,
+                    sequence_number=record.sequence_number,
+                    screenshot_reference=screenshot_reference,
+                )
+            )
+            db.add(
+                AuditEvent(
+                    audit_id=audit.id,
+                    event_type="tool_completed",
+                    from_status=None,
+                    to_status=None,
+                    message=(
+                        f"Completed {record.tool_name}."
+                        if record.status != "rejected"
+                        else f"Rejected {record.tool_name}."
+                    ),
+                    details={
+                        "tool_name": record.tool_name,
+                        "tool_sequence_number": record.sequence_number,
+                        "status": record.status,
+                        "success": record.result.success,
+                    },
+                    sequence_number=_next_event_sequence(db, audit.id),
+                    created_at=record.completed_at,
+                )
+            )
+
+        def on_report_started() -> None:
+            if audit.status == AuditStatus.PLANNING.value:
+                on_tools_selected([])
+            transition_audit_status(
+                db,
+                audit,
+                AuditStatus.GENERATING_REPORT,
+                event_type="report_started",
+                message="Gemini is generating the evidence-grounded report.",
+                details={"agentic": True},
+            )
+
+        report = run_audit_workflow(
+            target_url=str(audit_data.target_url),
+            instruction=audit_data.instruction,
+            callbacks=WorkflowCallbacks(
+                on_tools_selected=on_tools_selected,
+                on_tool_started=on_tool_started,
+                on_tool_completed=on_tool_completed,
+                on_report_started=on_report_started,
+            ),
         )
-        transition_audit_status(
-            db,
-            audit,
-            AuditStatus.GENERATING_REPORT,
-            event_type="report_started",
-            message="Generating the mock report.",
-            details={"mock": True},
-        )
+        audit.report = report.model_dump(mode="json")
+        audit.overall_score = report.overall_score
+        audit.release_status = report.release_status.value
+        audit.error_message = None
         transition_audit_status(
             db,
             audit,
             AuditStatus.COMPLETED,
             event_type="audit_completed",
-            message="Mock audit completed.",
-            details={"mock": True},
+            message="Agentic audit completed with a validated report.",
+            details={"agentic": True},
         )
         db.commit()
         db.refresh(audit)
+    except AuditWorkflowError as exc:
+        audit.error_message = str(exc)
+        transition_audit_status(
+            db,
+            audit,
+            AuditStatus.FAILED,
+            event_type="audit_failed",
+            message="The agentic audit workflow failed.",
+            details={"error": str(exc)},
+        )
+        try:
+            db.commit()
+            db.refresh(audit)
+        except SQLAlchemyError as db_exc:
+            db.rollback()
+            raise AuditDatabaseError from db_exc
     except SQLAlchemyError as exc:
         db.rollback()
         raise AuditDatabaseError from exc
 
-    return _audit_detail(audit, [])
+    try:
+        tool_executions = _get_owned_tool_executions(
+            db,
+            current_user.id,
+            [audit.id],
+        )
+    except SQLAlchemyError as exc:
+        raise AuditDatabaseError from exc
+    return _audit_detail(audit, tool_executions)
 
 
 def _get_owned_audit(db: Session, user_id: int, audit_id: int) -> Audit:

@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
@@ -53,9 +53,14 @@ class AuditFinding(BaseModel):
     severity: FindingSeverity
     title: str
     description: str
-    evidence: dict[str, Any]
+    evidence: dict[str, Any] = Field(min_length=1)
     recommended_fix: str
-    source_tool: str
+    source_tool: Literal[
+        "inspect_metadata",
+        "inspect_security_headers",
+        "check_broken_links",
+        "inspect_browser",
+    ]
     is_release_blocker: bool = False
 
 
