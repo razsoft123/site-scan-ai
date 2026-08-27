@@ -1,21 +1,22 @@
-from ipaddress import ip_address
 from time import perf_counter
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin
 
 import httpx
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 
 from app.schemas.tool import ToolError, ToolResult
+from app.tools.http_safety import (
+    DEFAULT_MAX_REDIRECTS,
+    DEFAULT_TIMEOUT_SECONDS,
+    REDIRECT_STATUS_CODES,
+    validate_target_url,
+)
 
 
 TOOL_NAME = "inspect_metadata"
-DEFAULT_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_RESPONSE_BYTES = 2_000_000
-DEFAULT_MAX_REDIRECTS = 5
 HTML_MEDIA_TYPES = {"text/html", "application/xhtml+xml"}
-REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
-BLOCKED_HOST_SUFFIXES = (".internal", ".lan", ".local", ".localhost")
 
 
 def _duration_ms(started_at: float) -> int:
@@ -36,42 +37,6 @@ def _result(
         data=data or {},
         errors=errors or [],
     )
-
-
-def _validate_target_url(url: str) -> str:
-    try:
-        parsed = urlsplit(url)
-        hostname = parsed.hostname
-    except ValueError as exc:
-        raise ValueError("The target URL is malformed.") from exc
-
-    if parsed.scheme.lower() not in {"http", "https"}:
-        raise ValueError("Only HTTP and HTTPS URLs can be inspected.")
-    if hostname is None:
-        raise ValueError("The target URL must contain a hostname.")
-    if parsed.username is not None or parsed.password is not None:
-        raise ValueError("URLs containing credentials cannot be inspected.")
-
-    hostname = hostname.lower().rstrip(".")
-    if (
-        hostname == "localhost"
-        or hostname.endswith(BLOCKED_HOST_SUFFIXES)
-        or ("." not in hostname and ":" not in hostname)
-    ):
-        raise ValueError("Local and internal hostnames cannot be inspected.")
-
-    try:
-        address = ip_address(hostname)
-    except ValueError:
-        pass
-    else:
-        if not address.is_global:
-            raise ValueError("Private and non-public IP addresses cannot be inspected.")
-
-    try:
-        return str(httpx.URL(url))
-    except httpx.InvalidURL as exc:
-        raise ValueError("The target URL is malformed.") from exc
 
 
 def _meta_content(soup: BeautifulSoup, attribute: str, expected: str) -> str | None:
@@ -176,7 +141,7 @@ def inspect_metadata(
 ) -> ToolResult:
     started_at = perf_counter()
     try:
-        requested_url = _validate_target_url(url)
+        requested_url = validate_target_url(url)
     except ValueError as exc:
         return _result(
             started_at,
@@ -252,7 +217,7 @@ def inspect_metadata(
 
                     redirected_url = urljoin(str(response.url), location)
                     try:
-                        current_url = _validate_target_url(redirected_url)
+                        current_url = validate_target_url(redirected_url)
                     except ValueError as exc:
                         return _result(
                             started_at,
