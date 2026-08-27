@@ -235,6 +235,13 @@ def test_workflow_failure_is_saved_as_failed_audit(
     db_session: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    logged_errors: list[str] = []
+
+    def capture_exception(message: str, *_: object, **__: object) -> None:
+        logged_errors.append(message)
+
+    monkeypatch.setattr(audit_service.logger, "exception", capture_exception)
+
     def failing_workflow(*, callbacks, **_: object) -> AuditReport:
         callbacks.on_tools_selected([])
         raise AuditWorkflowError("Gemini could not complete the audit workflow.")
@@ -248,6 +255,10 @@ def test_workflow_failure_is_saved_as_failed_audit(
     assert audit["report"] is None
     assert audit["release_status"] is None
     assert audit["error_message"] == "Gemini could not complete the audit workflow."
+    assert logged_errors == [
+        "audit_event=workflow_failed audit_id=%s user_id=%s target_url=%s "
+        "status=%s public_error=%s"
+    ]
     events = client.get(
         f"/audits/{audit['id']}/events",
         headers=auth_headers(user),

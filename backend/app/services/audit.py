@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -31,6 +32,9 @@ from app.schemas.audit import (
     ToolExecutionResponse,
 )
 from app.tools.http_safety import validate_public_url
+
+
+logger = logging.getLogger("uvicorn.error")
 
 
 VALID_STATUS_TRANSITIONS: dict[str, set[str]] = {
@@ -171,6 +175,12 @@ def create_audit(
     try:
         db.add(audit)
         db.flush()
+        logger.info(
+            "audit_event=workflow_started audit_id=%s user_id=%s target_url=%s",
+            audit.id,
+            current_user.id,
+            audit.target_url,
+        )
         db.add(
             AuditEvent(
                 audit_id=audit.id,
@@ -192,6 +202,11 @@ def create_audit(
         )
 
         def on_tools_selected(tool_names: list[str]) -> None:
+            logger.info(
+                "audit_event=tools_selected audit_id=%s tools=%s",
+                audit.id,
+                ",".join(tool_names) if tool_names else "none",
+            )
             if audit.status == AuditStatus.PLANNING.value:
                 transition_audit_status(
                     db,
@@ -221,6 +236,12 @@ def create_audit(
             sequence_number: int,
             started_at: datetime,
         ) -> None:
+            logger.info(
+                "audit_event=tool_started audit_id=%s sequence=%s tool=%s",
+                audit.id,
+                sequence_number,
+                tool_name,
+            )
             db.add(
                 AuditEvent(
                     audit_id=audit.id,
@@ -239,6 +260,20 @@ def create_audit(
             )
 
         def on_tool_completed(record: ToolExecutionRecord) -> None:
+            error_details = ";".join(
+                f"{error.code}:{error.message}" for error in record.result.errors
+            )
+            logger.info(
+                "audit_event=tool_completed audit_id=%s sequence=%s tool=%s "
+                "status=%s success=%s duration_ms=%s errors=%s",
+                audit.id,
+                record.sequence_number,
+                record.tool_name,
+                record.status,
+                record.result.success,
+                record.result.duration_ms,
+                error_details or "none",
+            )
             screenshot_reference = record.result.data.get("screenshot_reference")
             if not isinstance(screenshot_reference, str):
                 screenshot_reference = None
@@ -288,6 +323,10 @@ def create_audit(
             )
 
         def on_report_started() -> None:
+            logger.info(
+                "audit_event=report_started audit_id=%s",
+                audit.id,
+            )
             if audit.status == AuditStatus.PLANNING.value:
                 on_tools_selected([])
             transition_audit_status(
@@ -323,7 +362,25 @@ def create_audit(
         )
         db.commit()
         db.refresh(audit)
+        logger.info(
+            "audit_event=workflow_completed audit_id=%s status=%s "
+            "duration_ms=%s release_status=%s findings=%s",
+            audit.id,
+            audit.status,
+            audit.duration_ms,
+            audit.release_status,
+            len(report.findings),
+        )
     except AuditWorkflowError as exc:
+        logger.exception(
+            "audit_event=workflow_failed audit_id=%s user_id=%s target_url=%s "
+            "status=%s public_error=%s",
+            getattr(audit, "id", None),
+            current_user.id,
+            audit.target_url,
+            audit.status,
+            str(exc),
+        )
         audit.error_message = str(exc)
         transition_audit_status(
             db,
@@ -337,9 +394,20 @@ def create_audit(
             db.commit()
             db.refresh(audit)
         except SQLAlchemyError as db_exc:
+            logger.exception(
+                "audit_event=failure_persistence_failed audit_id=%s user_id=%s",
+                getattr(audit, "id", None),
+                current_user.id,
+            )
             db.rollback()
             raise AuditDatabaseError from db_exc
     except SQLAlchemyError as exc:
+        logger.exception(
+            "audit_event=database_failed audit_id=%s user_id=%s target_url=%s",
+            getattr(audit, "id", None),
+            current_user.id,
+            audit.target_url,
+        )
         db.rollback()
         raise AuditDatabaseError from exc
 
@@ -350,6 +418,11 @@ def create_audit(
             [audit.id],
         )
     except SQLAlchemyError as exc:
+        logger.exception(
+            "audit_event=tool_execution_lookup_failed audit_id=%s user_id=%s",
+            getattr(audit, "id", None),
+            current_user.id,
+        )
         raise AuditDatabaseError from exc
     return _audit_detail(audit, tool_executions)
 

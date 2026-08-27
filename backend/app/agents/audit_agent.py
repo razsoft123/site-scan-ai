@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -20,6 +21,9 @@ from app.tools import (
     inspect_metadata,
     inspect_security_headers,
 )
+
+
+logger = logging.getLogger("uvicorn.error")
 
 
 DEFAULT_MAX_TOOL_ROUNDS = 6
@@ -247,6 +251,11 @@ def _invoke_tool(tool_name: str, arguments: dict[str, Any]) -> ToolResult:
             result = asyncio.run(result)
         return ToolResult.model_validate(result)
     except Exception:
+        logger.exception(
+            "audit_event=tool_execution_exception tool=%s target_url=%s",
+            tool_name,
+            arguments.get("url", "unknown"),
+        )
         return ToolResult(
             tool=tool_name,
             success=False,
@@ -316,10 +325,27 @@ def _validate_report_evidence(
 
 
 def _generate_content(client: Any, **kwargs: Any) -> Any:
+    model = kwargs.get("model", "unknown")
+    started_at = perf_counter()
+    logger.debug("audit_event=gemini_request_started model=%s", model)
     try:
-        return client.models.generate_content(**kwargs)
+        response = client.models.generate_content(**kwargs)
     except Exception as exc:
+        logger.exception(
+            "audit_event=gemini_request_failed model=%s duration_ms=%s",
+            model,
+            max(0, int((perf_counter() - started_at) * 1000)),
+        )
         raise AuditWorkflowError("Gemini could not complete the audit workflow.") from exc
+    logger.debug(
+        "audit_event=gemini_request_completed model=%s duration_ms=%s "
+        "candidates=%s function_calls=%s",
+        model,
+        max(0, int((perf_counter() - started_at) * 1000)),
+        len(getattr(response, "candidates", None) or []),
+        len(getattr(response, "function_calls", None) or []),
+    )
+    return response
 
 
 def _create_gemini_client() -> tuple[Any, str]:
@@ -375,7 +401,6 @@ def run_audit_workflow(
         tool_config=types.ToolConfig(
             function_calling_config=types.FunctionCallingConfig(
                 mode=types.FunctionCallingConfigMode.AUTO,
-                allowed_function_names=list(TOOL_REGISTRY),
             )
         ),
     )
@@ -518,7 +543,8 @@ def run_audit_workflow(
         system_instruction=SYSTEM_INSTRUCTION,
         temperature=0,
         response_mime_type="application/json",
-        response_schema=AuditReport,
+        response_json_schema=AuditReport.model_json_schema(),
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
 
     evidence_error: AuditWorkflowError | None = None

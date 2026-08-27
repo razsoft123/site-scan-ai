@@ -173,7 +173,17 @@ def test_manual_tool_loop_executes_allowlisted_tool_and_returns_report(
     assert completed[0].result.success is True
     assert len(client.models.calls) == 3
     assert client.models.calls[0]["config"].automatic_function_calling.disable is True
-    assert client.models.calls[-1]["config"].response_schema is AuditReport
+    function_calling_config = (
+        client.models.calls[0]["config"].tool_config.function_calling_config
+    )
+    assert function_calling_config.mode == types.FunctionCallingConfigMode.AUTO
+    assert function_calling_config.allowed_function_names is None
+    assert client.models.calls[-1]["config"].response_schema is None
+    assert (
+        client.models.calls[-1]["config"].response_json_schema
+        == AuditReport.model_json_schema()
+    )
+    assert client.models.calls[-1]["config"].automatic_function_calling.disable is True
 
     tool_response_content = client.models.calls[1]["contents"][-1]
     returned_result = tool_response_content.parts[0].function_response.response
