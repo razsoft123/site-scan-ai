@@ -9,6 +9,7 @@ import app.models  # Register all tables with SQLAlchemy metadata.
 from app.core.register_handlers import register_exception_handlers
 from app.db.base import Base
 from app.db.database import engine
+from app.routes.audit import router as audit_router
 from app.routes.auth import router as auth_router
 
 logger = logging.getLogger("uvicorn.error")
@@ -35,6 +36,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Site Scan AI API", lifespan=lifespan)
 register_exception_handlers(app)
 app.include_router(auth_router)
+app.include_router(audit_router)
 
 
 @app.get("/health")
