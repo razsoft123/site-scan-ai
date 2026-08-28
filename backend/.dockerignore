@@ -1,0 +1,6 @@
+# Send only the application and locked dependencies to the Docker daemon.
+*
+!requirements.txt
+!requirements.prod.txt
+!app
+!app/**

@@ -1,0 +1,10 @@
+# Send only files required by the frontend build to the Docker daemon.
+*
+!package.json
+!package-lock.json
+!index.html
+!tsconfig.json
+!vite.config.ts
+!src
+!src/**
+!nginx.conf

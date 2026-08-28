@@ -1,0 +1,27 @@
+# Runtime-only dependency set. Test tooling and unused packages from the local
+# development environment are intentionally excluded from the image.
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.14.2
+beautifulsoup4==4.13.4
+click==8.4.2
+email-validator==2.2.0
+fastapi==0.141.1
+greenlet==3.5.5
+google-genai==2.20.0
+h11==0.16.0
+httpx==0.28.1
+idna==3.19
+playwright==1.62.0
+psycopg2==2.9.12
+pydantic==2.13.4
+pydantic-settings==2.15.0
+pydantic_core==2.46.4
+pwdlib[argon2]==0.3.0
+PyJWT==2.10.1
+python-dotenv==1.2.3
+SQLAlchemy==2.0.52
+starlette==1.6.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+uvicorn==0.52.4
