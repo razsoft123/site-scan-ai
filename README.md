@@ -1,139 +1,151 @@
-# site-scan-ai
+# Site Scan AI
 
-## Backend setup
+An evidence-first website auditing platform that combines deterministic Python
+tools with Google Gemini to produce clear, traceable audit reports.
 
-After installing the Python dependencies, install the Chromium runtime used by
-the deterministic browser inspector:
+[View the live application](https://sitescanai.razsoft.in/)
 
-```powershell
-cd backend
-python -m pip install -r requirements.txt
-python -m playwright install chromium
+## Try the demo
+
+Use the shared portfolio account to explore the complete audit workflow:
+
+| Field | Value |
+| --- | --- |
+| Email | `test@example.com` |
+| Password | `Test@1234` |
+
+This is a public account. Do not submit private, confidential, or internal URLs.
+
+## The problem it solves
+
+Auditing a website often requires several disconnected tools for metadata,
+security headers, broken links, and browser errors. The results are usually
+scattered and difficult to turn into a practical list of improvements.
+
+An LLM by itself is not a reliable scanner because it can describe issues it
+has not actually observed. Site Scan AI uses a hybrid approach:
+
+- Python tools collect facts directly from HTTP responses and Chromium.
+- Gemini selects the relevant tools and explains their results.
+- Every finding must reference evidence returned by an executed tool.
+- Pydantic validates the final report before it is stored.
+
+The core principle is: **AI plans and explains; deterministic code collects the
+evidence.**
+
+## Main features
+
+- User registration, login, and JWT-based authentication.
+- Custom website audits based on a URL and natural-language instruction.
+- Gemini-powered tool selection through controlled function calling.
+- Metadata, security-header, broken-link, and browser-runtime inspection.
+- Evidence-backed findings with severity, category, and recommended fixes.
+- Release-readiness states such as ready, needs attention, blocked, and unknown.
+- Full audit history with workflow events and individual tool executions.
+- Responsive React dashboard with raw evidence and execution details.
+- Full-page browser screenshots for runtime audits.
+
+## Deterministic audit tools
+
+| Tool | What it checks |
+| --- | --- |
+| `inspect_metadata` | HTTP status, title, description, canonical URL, robots, viewport, Open Graph fields, headings, image `alt` coverage, language, and page size |
+| `inspect_security_headers` | CSP, HSTS, content-type protection, referrer policy, permissions policy, and clickjacking protection |
+| `check_broken_links` | Extracted and normalized links, redirects, working links, broken links, timeouts, and final response statuses |
+| `inspect_browser` | Rendered title, page status, final URL, JavaScript errors, failed requests, load duration, response size, and screenshot |
+
+Gemini never decides whether a header, metadata field, or broken link exists.
+Those results come from the deterministic tools.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    UI[React and TypeScript client] -->|Authenticated REST API| API[FastAPI]
+    API --> SERVICE[Audit service and state machine]
+    SERVICE --> GEMINI[Gemini planner]
+    GEMINI -->|Validated request| REGISTRY[Allowlisted tool registry]
+    REGISTRY --> TOOLS[HTTPX, BeautifulSoup, and Playwright tools]
+    TOOLS -->|Structured evidence| GEMINI
+    GEMINI --> REPORT[Pydantic report validation]
+    REPORT --> DB[(PostgreSQL)]
+    SERVICE --> HISTORY[Audit events and tool executions]
+    HISTORY --> DB
 ```
 
-Set `GEMINI_API_KEY` in `backend/.env`. `GEMINI_MODEL` defaults to
-`gemini-3.1-flash-lite` and can be overridden in the same file.
+### Agent workflow
 
-Start the API from the `backend` folder:
+1. The user submits a public URL and an audit instruction.
+2. The backend validates the target before allowing a network request.
+3. Gemini selects from four explicitly declared tools.
+4. The backend validates the tool name, arguments, target URL, and workflow
+   limits.
+5. The selected Python tools collect structured evidence.
+6. Gemini converts that evidence into an `AuditReport`.
+7. The backend verifies the report and saves it with its complete execution
+   history.
 
-```powershell
-uvicorn app.main:app --reload --port 8000
-```
+Only functions in a hard-coded registry can run. The project does not use
+`eval()`, dynamic imports, or unrestricted function names supplied by the
+model.
 
-## Frontend setup
+## Evidence and security safeguards
 
-The frontend is a Vite-powered React and TypeScript application using Tailwind
-CSS, Zod, and Zustand. Install and start it with:
+The reporting workflow rejects unsupported claims and prevents Gemini from:
 
-```powershell
-cd frontend
-Copy-Item .env.example .env
-npm install
-npm run dev
-```
+- Referencing a tool that was not executed.
+- Changing the approved audit target.
+- Calling the same tool repeatedly.
+- Inventing headers, status codes, URLs, errors, screenshots, or scores.
+- Treating text from the inspected website as trusted instructions.
 
-The application opens at `http://localhost:5173` and calls the FastAPI server at
-`http://localhost:8000` by default. Change `VITE_API_URL` in `frontend/.env` if
-the API runs elsewhere. For a deployed frontend, add its exact origin to
-`CORS_ORIGINS` in `backend/.env` as a JSON array.
+Because the backend visits user-supplied URLs, it also implements SSRF
+protection. It blocks non-HTTP protocols, local and internal hostnames,
+non-public IPv4 and IPv6 addresses, unsafe redirects, private browser
+subresources, and browser WebSocket requests.
 
-## Container images
+Request timeouts, response-size limits, redirect limits, link limits, bounded
+concurrency, and one browser scan at a time help control resource usage.
 
-The frontend image builds the React application with Node and serves only the
-resulting static files from an unprivileged Nginx process on port `8080`. Node is
-not present in the runtime image. The backend image runs one Uvicorn worker on
-port `8000` and installs only Playwright's Chromium browser.
+## Application structure
 
-Build locally from the repository root:
+### Frontend
 
-```bash
-docker build \
-  --build-arg VITE_API_URL=https://api.example.com \
-  --tag site-scan-frontend:latest \
-  frontend
+- React 19, TypeScript, Vite, and Tailwind CSS.
+- Zustand for authentication and audit state.
+- Zod for form validation and runtime API-response validation.
+- Clean dashboard for creating audits and reviewing findings, recommendations,
+  tool results, durations, and evidence.
 
-docker build --tag site-scan-backend:latest backend
-```
+### Backend
 
-`VITE_API_URL` is compiled into the frontend bundle. Rebuild the frontend image
-when that URL changes.
+- FastAPI routes for authentication and user-owned audits.
+- Service layer for business logic and audit status transitions.
+- Pydantic schemas for strict request, tool-result, and report contracts.
+- SQLAlchemy models backed by PostgreSQL and JSONB.
+- Google Gemini orchestration with an allowlisted tool registry.
+- HTTPX and BeautifulSoup for deterministic HTTP inspection.
+- Playwright and Chromium for browser-runtime analysis.
+- Structured application logs with detailed internal exceptions.
 
-Create a backend environment file outside the repository containing at least:
+### Data model
 
-```dotenv
-DB_USERNAME=site_scan
-DB_PASSWORD=replace-me
-DB_HOST=database-host
-DB_PORT=5432
-DB_NAME=site_scan
-JWT_SECRET_KEY=replace-with-at-least-32-characters
-GEMINI_API_KEY=replace-me
-GEMINI_MODEL=gemini-3.1-flash-lite
-CORS_ORIGINS=["https://app.example.com"]
-```
+| Model | Responsibility |
+| --- | --- |
+| `User` | Account identity, password hash, active state, and timestamps |
+| `Audit` | Target, instruction, workflow status, report, release status, and timing |
+| `AuditEvent` | Ordered history of audit creation, transitions, tool activity, completion, and failure |
+| `ToolExecution` | Tool arguments, evidence, errors, result status, duration, sequence, and screenshot reference |
 
-Example low-memory runtime commands:
+## Technology stack
 
-```bash
-docker run -d \
-  --name site-scan-backend \
-  --restart unless-stopped \
-  --env-file /opt/site-scan/backend.env \
-  --memory 384m \
-  --memory-swap 768m \
-  --shm-size 64m \
-  --publish 8000:8000 \
-  --volume site-scan-artifacts:/app/artifacts \
-  ghcr.io/OWNER/REPOSITORY-backend:latest
+**Frontend:** React 19, TypeScript, Vite, Tailwind CSS, Zustand, and Zod.
 
-docker run -d \
-  --name site-scan-frontend \
-  --restart unless-stopped \
-  --memory 32m \
-  --memory-swap 64m \
-  --publish 8080:8080 \
-  ghcr.io/OWNER/REPOSITORY-frontend:latest
-```
+**Backend:** Python 3.11, FastAPI, Pydantic, SQLAlchemy, PostgreSQL, Google
+Gemini, HTTPX, BeautifulSoup, Playwright, JWT, and Argon2 password hashing.
 
-The backend will not start unless PostgreSQL is reachable. Its health endpoint
-is `/health`; the frontend health endpoint is `/healthz`. Screenshots persist in
-the named `site-scan-artifacts` volume.
+## Project status
 
-### Manual GitHub builds
-
-Create a repository Actions secret named `VITE_API_URL` containing the public
-backend URL, such as `https://api.example.com`. Vite uses this value only while
-the frontend image is built. Backend database credentials, JWT settings, and
-Gemini credentials are not stored in GitHub; provide them from the server's
-environment file when starting the backend container.
-
-The two workflows are independent and have no inputs:
-
-- **Build frontend image** publishes
-  `ghcr.io/OWNER/REPOSITORY-frontend:latest`.
-- **Build backend image** publishes
-  `ghcr.io/OWNER/REPOSITORY-backend:latest`.
-
-Run either one from its **Actions → workflow name → Run workflow** page. Both
-use GitHub's built-in `GITHUB_TOKEN`, so no registry password secret is required.
-If a package is private, authenticate the server with a GitHub token that has
-`read:packages` before pulling it.
-
-Because the Compose image references always remain on `:latest`, updating the
-server does not require editing the Compose file. Docker still needs to pull the
-new image before recreating the containers:
-
-```bash
-docker compose pull
-docker compose up -d
-```
-
-### 512 MB server note
-
-The static frontend has a small memory footprint and the API is deliberately
-limited to one worker. Chromium is the variable part: a complex page can still
-use several hundred MB during a browser audit. Keep the application's existing
-one-browser-at-a-time limit, enable at least 1 GB of host swap, and monitor for
-OOM kills. If the other applications leave substantially less than 350–400 MB
-available, move browser audits to a larger worker instead of increasing
-concurrency.
+Site Scan AI is a portfolio project under active development. The current
+version demonstrates the complete evidence-first auditing workflow, and more
+features, deeper audit capabilities, and usability improvements are coming.

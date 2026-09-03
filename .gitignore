@@ -47,6 +47,10 @@ pip-wheel-metadata/
 *.db
 backend/artifacts/
 
+# Local Docker Compose deployment files
+docker-compose.yml
+docker-compose.yaml
+
 # Node/React dependencies
 node_modules/
 .pnp
